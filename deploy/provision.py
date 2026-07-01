@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Provision (or stop) a dedicated RunPod GPU pod running worker-diffuse.
+"""Manual RunPod pod control for worker-diffuse (rest.runpod.io/v1).
 
-A dedicated pod (not serverless) is used because continuous ~5fps img2img
-streaming needs a warm GPU with no cold-start / queue delay. The image bakes
-its own weights, so no network volume is needed and we can pick a low-RTT US
-datacenter.
+Normally the dreamdiffuse service on jimi owns the pod lifecycle (spins up on a
+viewer, stops on idle — see gpu.py). This script is the manual/admin equivalent
+for the build host: create, stop, status, terminate.
 
 Usage:
-  python3 deploy/provision.py                 # create pod, wait for /health, store in earl
-  python3 deploy/provision.py --gpu A5000     # cheaper GPU
-  python3 deploy/provision.py --stop          # terminate the pod (stop billing)
-  python3 deploy/provision.py --status        # show pod + health
+  python3 deploy/provision.py --create      # create a dedicated pod (US, 4090)
+  python3 deploy/provision.py --status
+  python3 deploy/provision.py --stop        # stop (release GPU, keep disk)
+  python3 deploy/provision.py --terminate   # delete the pod entirely
 """
 from __future__ import annotations
 
@@ -22,185 +21,115 @@ import time
 import urllib.error
 import urllib.request
 
-RUNPOD_GQL = "https://api.runpod.io/graphql"
-RUNPOD_REST = "https://api.runpod.io/v1"
+REST = "https://rest.runpod.io/v1"
 IMAGE = "ghcr.io/dr34mlab/worker-diffuse:latest"
 POD_NAME = "dreamdiffuse-worker"
 HTTP_PORT = 8000
-# GHCR registry auth for the private dr34mlab image (shared with worker-locate).
-REGISTRY_AUTH_ID = "cmr1ip6kl00br119lj838zsca"
-
-# GPU display names accepted by pod create (pods still use display names).
-GPUS = {
-    "4090": "NVIDIA GeForce RTX 4090",
-    "A5000": "NVIDIA RTX A5000",
-    "4080": "NVIDIA GeForce RTX 4080",
-    "A4000": "NVIDIA RTX A4000",
-}
-# US datacenters, tried in order for lowest RTT to jimi (US home).
+REGISTRY_AUTH_ID = "cmr1ip6kl00br119lj838zsca"  # ghcr-dr34mlab
+GPU_TYPES = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4080", "NVIDIA RTX A5000"]
 US_DCS = ["US-KS-2", "US-CA-2", "US-TX-3", "US-IL-1", "US-GA-1", "US-NC-1", "US-WA-1"]
 
 
 def earl(account: str) -> str:
     return subprocess.check_output(
         ["security", "find-generic-password", "-s", "earl", "-a", account, "-w"],
-        timeout=5,
-    ).decode().strip()
+        timeout=5).decode().strip()
 
 
-def store_earl(account: str, value: str) -> None:
-    subprocess.run(["security", "delete-generic-password", "-s", "earl", "-a", account],
-                   capture_output=True)
-    subprocess.check_call(["security", "add-generic-password", "-s", "earl",
-                           "-a", account, "-w", value])
-    print(f"  stored earl key: {account} = {value}")
-
-
-def _req(url: str, key: str, body: dict | None = None, method: str = "GET") -> dict:
+def req(path: str, key: str, body: dict | None = None, method: str = "GET") -> dict:
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url, data=data, method=method,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-    )
+    r = urllib.request.Request(f"{REST}/{path}", data=data, method=method,
+                               headers={"Content-Type": "application/json",
+                                        "Authorization": f"Bearer {key}"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return json.loads(r.read() or "{}")
+        with urllib.request.urlopen(r, timeout=45) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {"_ok": True}
     except urllib.error.HTTPError as e:
-        return {"_http_error": e.code, "_body": e.read().decode()}
-
-
-def gql(query: str, variables: dict, key: str) -> dict:
-    return _req(RUNPOD_GQL, key, {"query": query, "variables": variables}, "POST")
+        try:
+            return {"_error": json.loads(e.read()).get("error", str(e.code)), "_code": e.code}
+        except Exception:
+            return {"_error": str(e.code)}
 
 
 def proxy_url(pod_id: str) -> str:
     return f"https://{pod_id}-{HTTP_PORT}.proxy.runpod.net"
 
 
-def create_pod(key: str, gpu: str) -> str:
-    gpu_name = GPUS[gpu]
-    for dc in US_DCS:
-        for cloud in ("COMMUNITY", "SECURE"):
-            print(f"  trying {gpu_name} in {dc} ({cloud}) ...")
-            resp = _req(f"{RUNPOD_REST}/pods", key, {
-                "name": POD_NAME,
-                "imageName": IMAGE,
-                "gpuTypeId": gpu_name,
-                "gpuCount": 1,
-                "cloudType": cloud,
-                "dataCenterId": dc,
-                "containerDiskInGb": 25,
-                "volumeInGb": 0,
-                "ports": f"{HTTP_PORT}/http,22/tcp",
-                "env": [{"key": "PYTHONUNBUFFERED", "value": "1"}],
-                "containerRegistryAuthId": REGISTRY_AUTH_ID,
-            }, "POST")
-            pod_id = resp.get("id", "")
-            if pod_id:
-                print(f"  pod created: {pod_id} in {dc} ({cloud})")
-                return pod_id
-            err = resp.get("_body", resp)
-            print(f"    unavailable: {err}")
-    print("  FAILED: no US datacenter had the GPU available.", file=sys.stderr)
-    sys.exit(1)
+def find_pod(key: str) -> dict | None:
+    pods = req("pods", key)
+    items = pods if isinstance(pods, list) else pods.get("pods", pods.get("data", []))
+    for p in (items or []):
+        if p.get("name") == POD_NAME:
+            return p
+    return None
 
 
-def wait_runtime(key: str, pod_id: str, minutes: int = 8) -> None:
-    print(f"  waiting for pod runtime (up to {minutes} min) ...")
-    for i in range(minutes * 6):
-        time.sleep(10)
-        info = gql(
-            "query Pod($id: String!) { pod(input: {podId: $id}) { id runtime { uptimeInSeconds } } }",
-            {"id": pod_id}, key)
-        try:
-            rt = info["data"]["pod"]["runtime"]
-        except (KeyError, TypeError):
-            rt = None
-        if rt and rt.get("uptimeInSeconds", 0) > 0:
-            print(f"  runtime up after ~{(i + 1) * 10}s")
+def create(key: str) -> None:
+    for cloud in ("COMMUNITY", "SECURE"):
+        print(f"  creating {POD_NAME} ({cloud}, US) ...")
+        r = req("pods", key, {
+            "name": POD_NAME, "imageName": IMAGE, "gpuTypeIds": GPU_TYPES, "gpuCount": 1,
+            "cloudType": cloud, "computeType": "GPU", "containerDiskInGb": 25, "volumeInGb": 0,
+            "ports": [f"{HTTP_PORT}/http", "22/tcp"], "dataCenterIds": US_DCS,
+            "containerRegistryAuthId": REGISTRY_AUTH_ID, "env": {"PYTHONUNBUFFERED": "1"},
+        }, "POST")
+        pid = r.get("id")
+        if pid:
+            mach = r.get("machine") or {}
+            print(f"  pod {pid} on {mach.get('gpuTypeId')} @ {mach.get('dataCenterId')} "
+                  f"= ${r.get('costPerHr')}/hr")
+            print(f"  url: {proxy_url(pid)}")
+            wait_health(proxy_url(pid))
             return
-        if i % 6 == 5:
-            print(f"  ... still booting ({(i + 1) * 10}s)")
-    print("  WARNING: runtime not reported; continuing to health poll anyway.")
+        print(f"    {cloud}: {r.get('_error')}")
+    sys.exit("  create failed on both clouds")
 
 
-def wait_health(url: str, minutes: int = 10) -> bool:
-    print(f"  polling {url}/health (model bake + warm, up to {minutes} min) ...")
+def wait_health(url: str, minutes: int = 12) -> None:
+    print(f"  polling {url}/health (image pull + warm, up to {minutes} min) ...")
     deadline = time.time() + minutes * 60
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(f"{url}/health", timeout=10) as r:
+            with urllib.request.urlopen(f"{url}/health", timeout=8) as r:
                 h = json.loads(r.read())
                 if h.get("ready"):
-                    print(f"  HEALTHY: {json.dumps(h)}")
-                    return True
-                print(f"  ... {h}")
-        except Exception as e:
-            print(f"  ... not up yet ({type(e).__name__})")
+                    print(f"  READY: {json.dumps(h)}")
+                    return
+        except Exception:
+            pass
         time.sleep(10)
-    return False
-
-
-def find_pod(key: str) -> str:
-    try:
-        return earl("runpod_diffuse_pod_id")
-    except subprocess.CalledProcessError:
-        return ""
-
-
-def stop(key: str) -> None:
-    pod_id = find_pod(key)
-    if not pod_id:
-        print("  no stored pod id; nothing to stop.")
-        return
-    gql("mutation Terminate($input: PodTerminateInput!) { podTerminate(input: $input) }",
-        {"input": {"podId": pod_id}}, key)
-    print(f"  terminated pod {pod_id}. (billing stopped)")
-
-
-def status(key: str) -> None:
-    pod_id = find_pod(key)
-    print(f"  pod_id: {pod_id or '(none)'}")
-    if not pod_id:
-        return
-    url = proxy_url(pod_id)
-    print(f"  url:    {url}")
-    try:
-        with urllib.request.urlopen(f"{url}/health", timeout=10) as r:
-            print(f"  health: {r.read().decode()}")
-    except Exception as e:
-        print(f"  health: unreachable ({type(e).__name__})")
+    print("  health never went ready in time.")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gpu", default="4090", choices=list(GPUS))
-    ap.add_argument("--stop", action="store_true")
+    ap.add_argument("--create", action="store_true")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--stop", action="store_true")
+    ap.add_argument("--terminate", action="store_true")
     args = ap.parse_args()
-
     key = earl("RUNPOD_API_KEY_CLI")
 
+    if args.create:
+        create(key)
+        return
+
+    pod = find_pod(key)
+    if not pod:
+        print("  no dreamdiffuse-worker pod found.")
+        return
+    pid = pod["id"]
     if args.stop:
-        stop(key)
-        return
-    if args.status:
-        status(key)
-        return
-
-    pod_id = create_pod(key, args.gpu)
-    url = proxy_url(pod_id)
-    store_earl("runpod_diffuse_pod_id", pod_id)
-    store_earl("runpod_diffuse_url", url)
-
-    wait_runtime(key, pod_id)
-    ok = wait_health(url)
-
-    print()
-    print("Done." if ok else "Pod created but health never went ready — check logs.")
-    print(f"  pod_id: {pod_id}")
-    print(f"  url:    {url}")
-    print(f"  point dreamdiffuse at: {url}")
+        print(req(f"pods/{pid}/stop", key, method="POST"))
+    elif args.terminate:
+        print(req(f"pods/{pid}", key, method="DELETE"))
+        print(f"  terminated {pid}")
+    else:  # status
+        print(f"  pod {pid}: {pod.get('desiredStatus')}  "
+              f"{(pod.get('machine') or {}).get('gpuTypeId')} @ "
+              f"{(pod.get('machine') or {}).get('dataCenterId')}  ${pod.get('costPerHr')}/hr")
+        print(f"  url: {proxy_url(pid)}")
 
 
 if __name__ == "__main__":
