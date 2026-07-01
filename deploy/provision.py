@@ -27,6 +27,8 @@ RUNPOD_REST = "https://api.runpod.io/v1"
 IMAGE = "ghcr.io/dr34mlab/worker-diffuse:latest"
 POD_NAME = "dreamdiffuse-worker"
 HTTP_PORT = 8000
+# GHCR registry auth for the private dr34mlab image (shared with worker-locate).
+REGISTRY_AUTH_ID = "cmr1ip6kl00br119lj838zsca"
 
 # GPU display names accepted by pod create (pods still use display names).
 GPUS = {
@@ -91,6 +93,7 @@ def create_pod(key: str, gpu: str) -> str:
                 "volumeInGb": 0,
                 "ports": f"{HTTP_PORT}/http,22/tcp",
                 "env": [{"key": "PYTHONUNBUFFERED", "value": "1"}],
+                "containerRegistryAuthId": REGISTRY_AUTH_ID,
             }, "POST")
             pod_id = resp.get("id", "")
             if pod_id:
