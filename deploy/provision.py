@@ -26,7 +26,7 @@ IMAGE = "ghcr.io/dr34mlab/worker-diffuse:latest"
 POD_NAME = "dreamdiffuse-worker"
 HTTP_PORT = 8000
 REGISTRY_AUTH_ID = "cmr1ip6kl00br119lj838zsca"  # ghcr-dr34mlab
-GPU_TYPES = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4080", "NVIDIA RTX A5000"]
+GPU_TYPES = ["NVIDIA RTX A4000", "NVIDIA RTX A5000", "NVIDIA GeForce RTX 4090"]
 US_DCS = ["US-KS-2", "US-CA-2", "US-TX-3", "US-IL-1", "US-GA-1", "US-NC-1", "US-WA-1"]
 
 
