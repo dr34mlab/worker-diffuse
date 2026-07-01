@@ -28,12 +28,22 @@ python3 deploy/provision.py          # create dedicated RTX 4090 pod (US DC)
 python3 deploy/provision.py --stop   # terminate the pod (stop billing)
 ```
 
-`provision.py` stores the pod id + proxy URL in the earl keychain
-(`runpod_diffuse_pod_id`, `runpod_diffuse_url`) and prints the URL to point
-dreamdiffuse at.
+Normally you don't run `provision.py` at all — the dreamdiffuse service on jimi
+owns the pod lifecycle (spins up on a viewer, stops on idle). `provision.py` is
+just the manual/admin fallback for the build host.
+
+## Gotcha: Cloudflare proxy + User-Agent
+
+The pod's public HTTP endpoint (`https://<podid>-8000.proxy.runpod.net`) is
+fronted by Cloudflare. Its WAF **403s large POST bodies sent with the default
+`Python-urllib` User-Agent** (small requests pass, but a ~160KB base64 image POST
+gets blocked). Send a browser-like `User-Agent` header and it goes through — the
+dreamdiffuse client does. (A direct `<port>/tcp` mapping would bypass the proxy
+entirely — lower latency, no WAF — at the cost of a dynamic IP:port.)
 
 ## Cost
 
-Dedicated RTX 4090: ~$0.34–0.44/hr community, ~$0.69/hr secure. Billed
-continuously while the pod runs — stop it when idle (`provision.py --stop`,
-or dreamdiffuse's auto-idle pauses the stream so no frames are sent).
+Dedicated RTX 4090: ~$0.34–0.44/hr community, ~$0.69/hr secure (whichever has
+stock). Billed continuously while RUNNING — a STOPPED pod releases the GPU (≈$0,
+only pennies of disk) and resumes in ~15-40s. dreamdiffuse auto-stops it when no
+one is viewing; terminate to free even the disk.
